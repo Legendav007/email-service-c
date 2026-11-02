@@ -1,4 +1,4 @@
-/* server.c - MiniMail email server: one pthread per client, one mutex for shared state. */
+// server.c - MiniMail email server: one pthread per client, one mutex for shared state.
 #define _POSIX_C_SOURCE 200809L
 
 #include "common.h"
@@ -20,14 +20,9 @@
 
 #define MAX_LIST 256
 
-/* Global state */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile sig_atomic_t g_stop = 0;
 static int g_listen_fd = -1;
-
-/* Usernames with a live session; one entry per logged-in user. */
-static char g_active[MAX_CLIENTS][MAX_USER];
-static int  g_active_count = 0;
 
 typedef struct {
     int fd;
@@ -36,7 +31,7 @@ typedef struct {
     int logged_in;
 } client_ctx;
 
-/* Helpers */
+// Fills out with the current local time as "YYYY-MM-DD HH:MM:SS".
 static void now_string(char *out, size_t n)
 {
     time_t t = time(NULL);
@@ -46,6 +41,7 @@ static void now_string(char *out, size_t n)
     strftime(out, n, "%Y-%m-%d %H:%M:%S", &tm);
 }
 
+// Prints a timestamped line to the server console.
 static void log_msg(const char *fmt, ...)
 {
     va_list ap;
@@ -60,6 +56,7 @@ static void log_msg(const char *fmt, ...)
     fflush(stdout);
 }
 
+// Formats a response and sends it to one client as a single line.
 static void reply(int fd, const char *fmt, ...)
 {
     char buf[MAX_LINE];
@@ -71,44 +68,7 @@ static void reply(int fd, const char *fmt, ...)
     send_line(fd, buf);
 }
 
-/* Active session table */
-static int session_add(const char *user)
-{
-    int rc = 0;
-
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_active_count; i++) {
-        if (strcmp(g_active[i], user) == 0) {
-            rc = -1;
-            break;
-        }
-    }
-    if (rc == 0) {
-        if (g_active_count >= MAX_CLIENTS)
-            rc = -2;                    /* session table full */
-        else
-            snprintf(g_active[g_active_count++], MAX_USER, "%s", user);
-    }
-    pthread_mutex_unlock(&g_lock);
-    return rc;
-}
-
-static void session_remove(const char *user)
-{
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_active_count; i++) {
-        if (strcmp(g_active[i], user) == 0) {
-            g_active[i][0] = '\0';
-            for (int j = i; j < g_active_count - 1; j++)
-                memcpy(g_active[j], g_active[j + 1], MAX_USER);
-            g_active_count--;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_lock);
-}
-
-/* Command handlers */
+// REGISTER: validates the fields, rejects duplicates, saves the new account.
 static void cmd_register(client_ctx *c, char **f, int nf)
 {
     user_record u;
@@ -118,16 +78,15 @@ static void cmd_register(client_ctx *c, char **f, int nf)
         return;
     }
     if (!valid_username(f[1])) {
-        reply(c->fd, "ERR INVALID_USERNAME|3-31 chars, start with a letter, "
-                     "letters/digits/._ only");
+        reply(c->fd, "ERR INVALID_USERNAME|3-31 chars, start with a letter");
         return;
     }
     if (!valid_email(f[2])) {
         reply(c->fd, "ERR INVALID_EMAIL|Not a valid e-mail address");
         return;
     }
-    if (!valid_password(f[3])) {
-        reply(c->fd, "ERR WEAK_PASSWORD|Password must be 6-64 characters");
+    if (strlen(f[3]) < 6) {
+        reply(c->fd, "ERR WEAK_PASSWORD|Password must be at least 6 characters");
         return;
     }
 
@@ -151,27 +110,27 @@ static void cmd_register(client_ctx *c, char **f, int nf)
 
     if (store_add_user(&u) < 0) {
         pthread_mutex_unlock(&g_lock);
-        reply(c->fd, "ERR STORAGE|Could not persist the new account");
+        reply(c->fd, "ERR STORAGE|Could not save the new account");
         return;
     }
     pthread_mutex_unlock(&g_lock);
 
-    log_msg("REGISTER ok user=%s email=%s", u.username, u.email);
+    log_msg("REGISTER user=%s", u.username);
     reply(c->fd, "OK REGISTER|%s|%s", u.username, u.email);
 }
 
+// LOGIN: checks the password and marks this connection as logged in.
 static void cmd_login(client_ctx *c, char **f, int nf)
 {
     user_record u;
-    int unread;
+    int unread = 0;
 
     if (nf != 3) {
         reply(c->fd, "ERR BAD_REQUEST|LOGIN needs username and password");
         return;
     }
     if (c->logged_in) {
-        reply(c->fd, "ERR ALREADY_LOGGED_IN|You are already logged in as %s",
-              c->username);
+        reply(c->fd, "ERR ALREADY_LOGGED_IN|Already logged in as %s", c->username);
         return;
     }
 
@@ -181,46 +140,43 @@ static void cmd_login(client_ctx *c, char **f, int nf)
         reply(c->fd, "ERR NO_SUCH_USER|No account named '%s'", f[1]);
         return;
     }
-
     if (strcmp(f[2], u.password) != 0) {
         pthread_mutex_unlock(&g_lock);
         reply(c->fd, "ERR BAD_PASSWORD|Incorrect password");
         return;
     }
-    unread = store_unread_count(u.username);
-    pthread_mutex_unlock(&g_lock);
 
-    int add_rc = session_add(u.username);
-    if (add_rc == -1) {
-        reply(c->fd, "ERR ALREADY_ACTIVE|'%s' already has an active session",
-              u.username);
-        return;
+    mail_record *recs = malloc(sizeof(*recs) * MAX_LIST);
+    if (recs) {
+        int n = store_list_mail(u.username, BOX_INBOX, recs, MAX_LIST);
+        for (int i = 0; i < n; i++)
+            if (!recs[i].read)
+                unread++;
+        free(recs);
     }
-    if (add_rc == -2) {
-        reply(c->fd, "ERR SERVER_BUSY|Too many active sessions, try again later");
-        return;
-    }
+    pthread_mutex_unlock(&g_lock);
 
     snprintf(c->username, sizeof(c->username), "%s", u.username);
     c->logged_in = 1;
 
-    log_msg("LOGIN ok user=%s from %s", u.username, c->peer);
+    log_msg("LOGIN user=%s from %s", u.username, c->peer);
     reply(c->fd, "OK LOGIN|%s|%s|%d", u.username, u.email, unread);
 }
 
+// LOGOUT: clears the session on this connection.
 static void cmd_logout(client_ctx *c)
 {
     if (!c->logged_in) {
         reply(c->fd, "ERR NOT_LOGGED_IN|No active session");
         return;
     }
-    session_remove(c->username);
     log_msg("LOGOUT user=%s", c->username);
     reply(c->fd, "OK LOGOUT|%s", c->username);
     c->logged_in = 0;
     c->username[0] = '\0';
 }
 
+// SEND: checks every recipient exists, then stores a copy for each plus one in Sent.
 static void cmd_send(client_ctx *c, char **f, int nf)
 {
     char to_list[MAX_TO];
@@ -229,7 +185,6 @@ static void cmd_send(client_ctx *c, char **f, int nf)
     mail_record m;
     long id;
     char *save = NULL;
-    char *tok;
 
     if (!c->logged_in) {
         reply(c->fd, "ERR NOT_LOGGED_IN|Please LOGIN first");
@@ -247,22 +202,13 @@ static void cmd_send(client_ctx *c, char **f, int nf)
         reply(c->fd, "ERR EMPTY_SUBJECT|Subject must not be empty");
         return;
     }
-    if (strlen(f[2]) >= MAX_SUBJECT) {
-        reply(c->fd, "ERR SUBJECT_TOO_LONG|Subject exceeds %d characters",
-              MAX_SUBJECT - 1);
-        return;
-    }
     if (f[3][0] == '\0') {
         reply(c->fd, "ERR EMPTY_BODY|Message body must not be empty");
         return;
     }
-    if (strlen(f[3]) > MAX_BODY) {
-        reply(c->fd, "ERR MESSAGE_TOO_LONG|Body exceeds %d bytes", MAX_BODY);
-        return;
-    }
 
     snprintf(to_list, sizeof(to_list), "%s", f[1]);
-    for (tok = strtok_r(to_list, ",", &save); tok;
+    for (char *tok = strtok_r(to_list, ",", &save); tok;
          tok = strtok_r(NULL, ",", &save)) {
         while (*tok == ' ')
             tok++;
@@ -271,10 +217,6 @@ static void cmd_send(client_ctx *c, char **f, int nf)
         if (nrec >= MAX_RECIPIENTS) {
             reply(c->fd, "ERR TOO_MANY_RECIPIENTS|At most %d recipients",
                   MAX_RECIPIENTS);
-            return;
-        }
-        if (!valid_username(tok)) {
-            reply(c->fd, "ERR UNKNOWN_RECIPIENT|No such user: '%s'", tok);
             return;
         }
         snprintf(recipients[nrec++], MAX_USER, "%s", tok);
@@ -309,37 +251,27 @@ static void cmd_send(client_ctx *c, char **f, int nf)
     snprintf(m.body, sizeof(m.body), "%s", f[3]);
     now_string(m.date, sizeof(m.date));
 
-    /* One copy per recipient inbox, plus one copy in the sender's sent box. */
     for (int i = 0; i < nrec; i++) {
         snprintf(m.to, sizeof(m.to), "%s", recipients[i]);
         m.read = 0;
-        if (store_append_mail(recipients[i], BOX_INBOX, &m) < 0) {
-            pthread_mutex_unlock(&g_lock);
-            reply(c->fd, "ERR STORAGE|Could not deliver to '%s'",
-                  recipients[i]);
-            return;
-        }
+        store_append_mail(recipients[i], BOX_INBOX, &m);
     }
 
     snprintf(m.to, sizeof(m.to), "%s", f[1]);
     m.read = 1;
-    if (store_append_mail(c->username, BOX_SENT, &m) < 0) {
-        pthread_mutex_unlock(&g_lock);
-        reply(c->fd, "ERR STORAGE|Could not save a copy in Sent");
-        return;
-    }
+    store_append_mail(c->username, BOX_SENT, &m);
     pthread_mutex_unlock(&g_lock);
 
     log_msg("SEND id=%ld from=%s to=%s", id, c->username, f[1]);
     reply(c->fd, "OK SEND|%ld|%s", id, f[1]);
 }
 
+// Sends a whole mailbox as OK LIST, one M| line per message, then END.
 static void send_list(client_ctx *c, int box)
 {
-    mail_record *recs;
+    mail_record *recs = malloc(sizeof(*recs) * MAX_LIST);
     int n;
 
-    recs = malloc(sizeof(*recs) * MAX_LIST);
     if (!recs) {
         reply(c->fd, "ERR STORAGE|Out of memory");
         return;
@@ -363,6 +295,7 @@ static void send_list(client_ctx *c, int box)
     free(recs);
 }
 
+// INBOX: lists the messages this user received.
 static void cmd_inbox(client_ctx *c)
 {
     if (!c->logged_in) {
@@ -372,6 +305,7 @@ static void cmd_inbox(client_ctx *c)
     send_list(c, BOX_INBOX);
 }
 
+// SENT: lists the messages this user sent.
 static void cmd_sent(client_ctx *c)
 {
     if (!c->logged_in) {
@@ -381,6 +315,7 @@ static void cmd_sent(client_ctx *c)
     send_list(c, BOX_SENT);
 }
 
+// READ: returns one inbox message in full and marks it as read.
 static void cmd_read(client_ctx *c, char **f, int nf)
 {
     mail_record m;
@@ -397,10 +332,6 @@ static void cmd_read(client_ctx *c, char **f, int nf)
         return;
     }
     id = strtol(f[1], NULL, 10);
-    if (id <= 0) {
-        reply(c->fd, "ERR BAD_REQUEST|Invalid message id");
-        return;
-    }
 
     pthread_mutex_lock(&g_lock);
     if (store_get_mail(c->username, BOX_INBOX, id, &m) < 0) {
@@ -415,97 +346,11 @@ static void cmd_read(client_ctx *c, char **f, int nf)
     proto_escape(m.to, eto, sizeof(eto));
     proto_escape(m.subject, esub, sizeof(esub));
     proto_escape(m.body, ebody, sizeof(ebody));
-
     reply(c->fd, "OK READ|%ld|%s|%s|%s|%s|1|%s", m.id, efrom, eto, esub,
           m.date, ebody);
 }
 
-static void cmd_delete(client_ctx *c, char **f, int nf)
-{
-    long id;
-    int box = BOX_INBOX;
-
-    if (!c->logged_in) {
-        reply(c->fd, "ERR NOT_LOGGED_IN|Please LOGIN first");
-        return;
-    }
-    if (nf < 2 || nf > 3) {
-        reply(c->fd, "ERR BAD_REQUEST|DELETE needs id [inbox|sent]");
-        return;
-    }
-    id = strtol(f[1], NULL, 10);
-    if (id <= 0) {
-        reply(c->fd, "ERR BAD_REQUEST|Invalid message id");
-        return;
-    }
-    if (nf == 3) {
-        if (strcmp(f[2], "sent") == 0)
-            box = BOX_SENT;
-        else if (strcmp(f[2], "inbox") != 0) {
-            reply(c->fd, "ERR BAD_REQUEST|Box must be 'inbox' or 'sent'");
-            return;
-        }
-    }
-
-    pthread_mutex_lock(&g_lock);
-    if (store_delete_mail(c->username, box, id) < 0) {
-        pthread_mutex_unlock(&g_lock);
-        reply(c->fd, "ERR NO_SUCH_MAIL|No message with id %ld", id);
-        return;
-    }
-    pthread_mutex_unlock(&g_lock);
-
-    reply(c->fd, "OK DELETE|%ld", id);
-}
-
-static void cmd_stats(client_ctx *c)
-{
-    mail_record *recs;
-    int n, unread = 0, sent = 0;
-
-    if (!c->logged_in) {
-        reply(c->fd, "ERR NOT_LOGGED_IN|Please LOGIN first");
-        return;
-    }
-
-    recs = malloc(sizeof(*recs) * MAX_LIST);
-    if (!recs) {
-        reply(c->fd, "ERR STORAGE|Out of memory");
-        return;
-    }
-
-    pthread_mutex_lock(&g_lock);
-    n = store_list_mail(c->username, BOX_INBOX, recs, MAX_LIST);
-    for (int i = 0; i < n; i++)
-        if (!recs[i].read)
-            unread++;
-    sent = store_list_mail(c->username, BOX_SENT, recs, MAX_LIST);
-    pthread_mutex_unlock(&g_lock);
-
-    free(recs);
-    reply(c->fd, "OK STATS|%d|%d|%d", n, unread, sent);
-}
-
-static void cmd_whoami(client_ctx *c)
-{
-    user_record u;
-
-    if (!c->logged_in) {
-        reply(c->fd, "ERR NOT_LOGGED_IN|No active session");
-        return;
-    }
-    pthread_mutex_lock(&g_lock);
-    int found = store_find_user(c->username, &u);
-    pthread_mutex_unlock(&g_lock);
-
-    if (found < 0) {
-        reply(c->fd, "ERR STORAGE|Account record missing");
-        return;
-    }
-    reply(c->fd, "OK WHOAMI|%s|%s", u.username, u.email);
-}
-
-/* Request dispatch */
+// Splits one request line into fields and calls the matching command handler.
 static void handle_line(client_ctx *c, char *line)
 {
     char *fields[8];
@@ -524,7 +369,6 @@ static void handle_line(client_ctx *c, char *line)
     }
     snprintf(cmd, sizeof(cmd), "%s", fields[0]);
 
-    /* Decode escaped payload fields before the handlers see them. */
     for (int i = 1; i < nf; i++) {
         if (proto_unescape_inplace(fields[i]) < 0) {
             reply(c->fd, "ERR BAD_REQUEST|Malformed escape sequence");
@@ -532,78 +376,56 @@ static void handle_line(client_ctx *c, char *line)
         }
     }
 
-    if (strcmp(cmd, "REGISTER") == 0) {
+    if (strcmp(cmd, "REGISTER") == 0)
         cmd_register(c, fields, nf);
-    } else if (strcmp(cmd, "LOGIN") == 0) {
+    else if (strcmp(cmd, "LOGIN") == 0)
         cmd_login(c, fields, nf);
-    } else if (strcmp(cmd, "LOGOUT") == 0) {
+    else if (strcmp(cmd, "LOGOUT") == 0)
         cmd_logout(c);
-    } else if (strcmp(cmd, "SEND") == 0) {
+    else if (strcmp(cmd, "SEND") == 0)
         cmd_send(c, fields, nf);
-    } else if (strcmp(cmd, "INBOX") == 0) {
+    else if (strcmp(cmd, "INBOX") == 0)
         cmd_inbox(c);
-    } else if (strcmp(cmd, "SENT") == 0) {
+    else if (strcmp(cmd, "SENT") == 0)
         cmd_sent(c);
-    } else if (strcmp(cmd, "READ") == 0) {
+    else if (strcmp(cmd, "READ") == 0)
         cmd_read(c, fields, nf);
-    } else if (strcmp(cmd, "DELETE") == 0) {
-        cmd_delete(c, fields, nf);
-    } else if (strcmp(cmd, "STATS") == 0) {
-        cmd_stats(c);
-    } else if (strcmp(cmd, "WHOAMI") == 0) {
-        cmd_whoami(c);
-    } else if (strcmp(cmd, "PING") == 0) {
-        reply(c->fd, "OK PONG|%s", PROTOCOL_VERSION);
-    } else if (strcmp(cmd, "HELP") == 0) {
-        reply(c->fd, "OK HELP|REGISTER|LOGIN|LOGOUT|SEND|INBOX|SENT|READ|"
-                     "DELETE|STATS|WHOAMI|PING|QUIT");
-    } else {
+    else
         reply(c->fd, "ERR UNKNOWN_COMMAND|Unrecognised command '%s'", cmd);
-    }
 }
 
-/* Per-client thread */
+// Runs one client connection: greet, read requests until QUIT or disconnect.
 static void *client_thread(void *arg)
 {
     client_ctx *c = (client_ctx *)arg;
     char line[MAX_LINE];
 
     log_msg("CONNECT %s", c->peer);
-    reply(c->fd, "OK WELCOME|%s|Send HELP for the command list", PROTOCOL_VERSION);
+    reply(c->fd, "OK WELCOME|%s|Connected", PROTOCOL_VERSION);
 
     for (;;) {
         int rc = recv_line(c->fd, line, sizeof(line));
 
-        if (rc == 0) {
-            log_msg("DISCONNECT %s (peer closed)", c->peer);
+        if (rc == 0 || rc == -1)
             break;
-        }
-        if (rc == -1) {
-            log_msg("DISCONNECT %s (socket error)", c->peer);
-            break;
-        }
         if (rc == -2) {
             reply(c->fd, "ERR LINE_TOO_LONG|Request exceeds %d bytes", MAX_LINE);
             continue;
         }
-
         if (strcmp(line, "QUIT") == 0) {
             reply(c->fd, "OK BYE|Goodbye");
-            log_msg("QUIT %s", c->peer);
             break;
         }
-
         handle_line(c, line);
     }
 
-    if (c->logged_in)
-        session_remove(c->username);
-
+    log_msg("DISCONNECT %s", c->peer);
     close(c->fd);
     free(c);
     return NULL;
 }
 
+// SIGINT/SIGTERM handler: stops the accept loop and closes the listen socket.
 static void on_signal(int sig)
 {
     (void)sig;
@@ -613,14 +435,16 @@ static void on_signal(int sig)
     g_listen_fd = -1;
 }
 
+// Prints the server command-line options.
 static void usage(const char *prog)
 {
     printf("Usage: %s [-p port] [-d data_dir] [-b bind_address]\n", prog);
-    printf("  -p port          TCP port to listen on (default %d)\n", DEFAULT_PORT);
+    printf("  -p port          TCP port (default %d)\n", DEFAULT_PORT);
     printf("  -d data_dir      storage directory (default '%s')\n", DEFAULT_DATA_DIR);
-    printf("  -b bind_address  local address to bind (default 0.0.0.0)\n");
+    printf("  -b bind_address  local address (default 0.0.0.0)\n");
 }
 
+// Parses options, creates the listen socket, and accepts clients forever.
 int main(int argc, char **argv)
 {
     int port = DEFAULT_PORT;
@@ -638,18 +462,10 @@ int main(int argc, char **argv)
                 return 1;
             }
             break;
-        case 'd':
-            data_dir = optarg;
-            break;
-        case 'b':
-            bind_addr = optarg;
-            break;
-        case 'h':
-            usage(argv[0]);
-            return 0;
-        default:
-            usage(argv[0]);
-            return 1;
+        case 'd': data_dir = optarg; break;
+        case 'b': bind_addr = optarg; break;
+        case 'h': usage(argv[0]); return 0;
+        default:  usage(argv[0]); return 1;
         }
     }
 
@@ -720,7 +536,6 @@ int main(int argc, char **argv)
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, c) != 0) {
-            log_msg("ERROR cannot create thread for %s", c->peer);
             close(fd);
             free(c);
             continue;

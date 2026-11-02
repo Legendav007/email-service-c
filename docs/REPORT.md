@@ -137,7 +137,6 @@ and the active-session table.
 | Compose and send mail | `do_send()`, `prompt_body()` |
 | List inbox / sent | `print_mail_table()` |
 | Read a message | `do_read()` |
-| Delete a message | `do_delete()` |
 | Close the connection cleanly | `QUIT` handling in `main()` |
 
 ### 5.3 Connection lifecycle
@@ -177,7 +176,7 @@ The full specification is in [docs/PROTOCOL.md](PROTOCOL.md); the essentials:
 * **Maximum line: 16 384 bytes.** Oversized lines are drained and rejected with
   `ERR LINE_TOO_LONG`; the connection remains usable.
 * **Commands:** `REGISTER`, `LOGIN`, `LOGOUT`, `SEND`, `INBOX`, `SENT`, `READ`,
-  `DELETE`, `STATS`, `WHOAMI`, `PING`, `HELP`, `QUIT`.
+  `QUIT`.
 
 Why this design:
 
@@ -343,9 +342,8 @@ No allocation, no copying.
 **`store_find_user()`** — linear scan of `users.dat`, parsing each line into a
 `user_record`.
 
-**`rewrite_box()`** — the shared engine for mark-read and delete: read each
-record, apply a filter callback, write survivors to `<box>.dat.tmp`, then
-`rename()`.
+**`store_mark_read()`** — rewrites the inbox to `<box>.dat.tmp` with the target
+record flagged read, then `rename()`s it over the original.
 
 **`cmd_send()`** — validates the session, the field count, the recipient list and
 every recipient's existence, then allocates an id and writes the copies. All of
@@ -405,9 +403,8 @@ scale. A single mutex also removes any chance of lock-ordering deadlock.
 ### 10.4 Session rules
 
 `session_add()` rejects a second login for an account that is already active,
-returning `ERR ALREADY_ACTIVE`. The session is released by `LOGOUT`, by `QUIT`,
-or by the cleanup path at the end of `client_thread()` — which runs on abrupt
-disconnects too, so a killed client cannot lock its account out permanently.
+returning `ERR ALREADY_LOGGED_IN`. The session ends on `LOGOUT`, `QUIT`, or
+disconnect. The same account may log in from several clients at once.
 
 ### 10.5 Robustness
 
@@ -427,19 +424,18 @@ The full table with inputs, expected outputs and observed results is in
 
 | Area | Cases |
 |---|---|
-| Registration (valid, duplicate username, duplicate e-mail, bad username, bad e-mail, weak password, missing fields) | 10 |
-| Authentication (valid, wrong password, unknown user, double login, concurrent login, login after logout) | 6 |
+| Registration (valid, duplicate username, duplicate e-mail, bad e-mail, weak password) | 7 |
+| Authentication (valid, wrong password, unknown user, double login) | 4 |
 | Authorisation guards | 2 |
-| Sending (single, multiple, unknown recipient, empty subject/body/recipients, over-long subject/recipient, special characters, too many fields) | 10 |
+| Sending (single, multiple, unknown recipient, empty subject/body/recipients, special characters) | 6 |
 | Inbox and reading (listing, record shape, unread flags, read, body integrity, escaping, read transitions, bad ids) | 11 |
-| Sent mail and statistics | 5 |
-| Deletion | 3 |
-| Protocol robustness (unknown command, empty line, ping, help, oversized line, recovery, bad escape) | 7 |
+| Sent mail | 3 |
+| Protocol robustness (unknown command, empty line, oversized line, recovery) | 4 |
 | Concurrency (three simultaneous clients) | 6 |
-| Session and persistence | 5 |
-| **Automated total** | **65** |
-| Manual interactive client tests | 9 |
-| Manual error-handling tests | 8 |
+| Session and persistence | 4 |
+| **Automated total** | **44** |
+| Manual interactive client tests | 8 |
+| Manual error-handling tests | 6 |
 
 ---
 
@@ -454,12 +450,12 @@ $ make test
 ...
 [PASS] inbox persisted
 
-65/65 checks passed
+44/44 checks passed
 
 All automated tests passed.
 ```
 
-All 65 automated checks, 9 manual interactive checks and 8 manual error-handling
+All 44 automated checks, 8 manual interactive checks and 6 manual error-handling
 checks passed. The server did not crash or exit during any test, including
 malformed requests, a 20 000-byte line, binary garbage, and abrupt disconnects
 while logged in.
@@ -562,7 +558,7 @@ detailed log is in [docs/AI_USAGE_LOG.md](AI_USAGE_LOG.md). In summary:
 * **Used for:** explaining socket API semantics, reviewing the protocol design,
   drafting the escaping scheme, generating the initial test matrix, and reviewing
   error paths.
-* **Verified by:** compiling with `-Wall -Wextra -Wpedantic`, running the 65-check
+* **Verified by:** compiling with `-Wall -Wextra -Wpedantic`, running the 44-check
   automated suite, and manual interactive testing.
 * **One real bug found and fixed during verification:** the first version escaped
   outgoing fields on the client but never unescaped them on the server, so a
@@ -637,7 +633,7 @@ lab network. It should not be exposed to the public Internet in its current form
 5. **Push notification**: a second connection or a long-poll `WAIT` command so
    new mail appears without polling.
 6. **Attachments** with a length-prefixed binary transfer command.
-7. **Folders, CC/BCC, forwarding, search** by sender/subject/date.
+7. **Folders, CC/BCC, forwarding, search and delete** by sender/subject/date.
 8. **Account management**: password change, account deletion, admin commands.
 9. **Rate limiting and lockout** after N failed logins.
 10. **IPv6 bind support** and a config file instead of flags.

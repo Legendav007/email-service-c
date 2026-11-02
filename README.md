@@ -19,7 +19,7 @@ assignment (B.Tech. IT).
 | [protocol.c](protocol.c) / [common.h](common.h) | Framing, escaping, validation, shared limits |
 | [storage.c](storage.c) / [storage.h](storage.h) | File-based persistence for users and mail |
 | [Makefile](Makefile) | Build, test and clean targets |
-| [tests/test_protocol.py](tests/test_protocol.py) | 65-check automated protocol/functional test suite |
+| [tests/test_protocol.py](tests/test_protocol.py) | Automated test suite (development tool, not part of the demo) |
 | [tests/run_tests.sh](tests/run_tests.sh) | Build + run the suite |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Full application-layer protocol specification |
 | [docs/REPORT.md](docs/REPORT.md) | Project report (architecture, design, testing, security) |
@@ -83,11 +83,10 @@ send, logout and disconnect. Stop it with `Ctrl+C` (SIGINT) or SIGTERM.
 Menu:
 
 ```
- 1. Register            6. View Sent mail
- 2. Login               7. Delete a message
- 3. Compose / Send      8. Mailbox statistics
- 4. View Inbox          9. Logout
- 5. Read a message      0. Quit
+ 1. Register            5. Read a message
+ 2. Login               6. View Sent mail
+ 3. Compose / Send      7. Logout
+ 4. View Inbox          0. Quit
 ```
 
 When composing, type the body line by line and finish with a single `.` on its
@@ -119,7 +118,6 @@ Protocol limits (compile-time, in [common.h](common.h)):
 | `MAX_BODY` | 4096 | max message body |
 | `MAX_SUBJECT` | 128 | max subject |
 | `MAX_RECIPIENTS` | 10 | recipients per `SEND` |
-| `MAX_CLIENTS` | 128 | concurrent client slots |
 
 ---
 
@@ -207,7 +205,7 @@ Raw protocol over `netcat` (useful for demos and debugging):
 
 ```bash
 $ nc 127.0.0.1 9090
-OK WELCOME|MiniMail/1.0|Send HELP for the command list
+OK WELCOME|MiniMail/1.0|Connected
 REGISTER|carol|carol@iitlab.local|secret123
 OK REGISTER|carol|carol@iitlab.local
 LOGIN|carol|secret123
@@ -220,20 +218,74 @@ OK BYE|Goodbye
 
 ---
 
-## 9. Testing
+## 9. Three-client demonstration
+
+The assignment requires three clients connected simultaneously. Open four
+terminals in the project directory:
+
+```bash
+# terminal 1 - the server
+./server -p 9090
+
+# terminals 2, 3, 4 - three clients
+./client -p 9090
+```
+
+Then, in each client window:
+
+| Client | Register (choice 1) | Login (choice 2) |
+|--------|--------------------|------------------|
+| 2 | `alice` / `alice@iitlab.local` / `secret123` | `alice` / `secret123` |
+| 3 | `bob` / `bob@iitlab.local` / `secret123` | `bob` / `secret123` |
+| 4 | `carol` / `carol@iitlab.local` / `secret123` | `carol` / `secret123` |
+
+All three stay logged in at the same time. Now send mail between them:
+
+* In **alice's** window: choice `3`, To `bob,carol`, subject `Hello`, body
+  `Sent while all three clients were connected.`, then `.`
+* In **bob's** window: choice `3`, To `alice,carol`, subject `Re: Hello`, body
+  `Got it.`, then `.`
+* In **carol's** window: choice `3`, To `alice,bob`, subject `Re: Hello`, body
+  `Same here.`, then `.`
+
+Then in each window press `4` to see the inbox and `5` to read a message. The
+server log in terminal 1 shows all three connections interleaved:
+
+```
+[2026-11-02 10:00:01] CONNECT 127.0.0.1:51201
+[2026-11-02 10:00:01] CONNECT 127.0.0.1:51202
+[2026-11-02 10:00:01] CONNECT 127.0.0.1:51203
+[2026-11-02 10:00:05] LOGIN user=alice from 127.0.0.1:51201
+[2026-11-02 10:00:06] LOGIN user=bob from 127.0.0.1:51202
+[2026-11-02 10:00:07] LOGIN user=carol from 127.0.0.1:51203
+[2026-11-02 10:00:12] SEND id=1 from=alice to=bob,carol
+[2026-11-02 10:00:15] SEND id=2 from=bob to=alice,carol
+[2026-11-02 10:00:18] SEND id=3 from=carol to=alice,bob
+```
+
+To reset between runs, stop the server and delete the data directory:
+
+```bash
+rm -rf data
+```
+
+---
+
+## 10. Testing
 
 ```bash
 make test          # or: ./tests/run_tests.sh
 ```
 
-The suite starts its own server on port 9191 with a scratch data directory
-(`tests/tmp/`), then runs 65 checks covering registration, authentication,
-sending, inbox/sent listing, read/unread transitions, deletion, escaping,
-malformed input, oversized lines, three simultaneous clients, session rules and
-persistence. Expected output ends with:
+The suite is a development aid only — the demonstration itself is done manually
+with `./server` and `./client`. It starts its own server on port 9191 with a
+scratch data directory (`tests/tmp/`), then runs 44 checks covering registration,
+authentication, sending, inbox/sent listing, read/unread transitions, escaping,
+malformed input, oversized lines, three simultaneous clients and persistence.
+Expected output ends with:
 
 ```
-65/65 checks passed
+44/44 checks passed
 All automated tests passed.
 ```
 
@@ -241,7 +293,7 @@ See [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) for the full test-case table.
 
 ---
 
-## 10. Known limitations
+## 11. Known limitations
 
 * **Plaintext transport.** Traffic is unencrypted; passwords cross the wire in
   the clear. TLS is listed as a future enhancement.
@@ -249,10 +301,10 @@ See [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) for the full test-case table.
   teaching-scale workload but would not scale to thousands of clients.
 * **Thread-per-client.** Each connection costs a thread; there is no thread pool
   and no idle timeout.
-* **One active session per user.** A second login for the same account is
-  rejected with `ERR ALREADY_ACTIVE`.
-* **No attachments, folders, CC/BCC, forwarding or search.** Only inbox and sent
-  boxes exist.
+* **One session per connection.** A second `LOGIN` on the same connection is
+  rejected; the same account may log in from several clients at once.
+* **No attachments, folders, CC/BCC, forwarding, search or delete.** Only inbox
+  and sent boxes exist.
 * **Linear file scans.** Listing and lookup read whole files; no indexes.
 * **No message size beyond 4 KB body / 16 KB line**, and at most 10 recipients
   per message.
@@ -265,7 +317,7 @@ See [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md) for the full test-case table.
 
 ---
 
-## 11. Security notes
+## 12. Security notes
 
 * Passwords are stored in plain text in `users.dat`. This keeps the code simple
   and the data easy to inspect during a viva, but it is **not** acceptable for a

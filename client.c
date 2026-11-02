@@ -1,10 +1,9 @@
-/* client.c - MiniMail interactive client: menu action -> one protocol request line. */
+// client.c - MiniMail interactive client: menu action -> one protocol request line.
 #define _POSIX_C_SOURCE 200809L
 
 #include "common.h"
 
 #include <arpa/inet.h>
-#include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -21,24 +20,20 @@ static char g_user[MAX_USER];
 static char g_email[MAX_EMAIL];
 static int g_logged_in = 0;
 
-/* Sends one request line with each field escaped; NULL omits a trailing field. */
+// Builds one request line, escaping each field, and sends it to the server.
 static int request(const char *cmd, const char *a, const char *b, const char *c)
 {
     char buf[MAX_LINE];
-    char ea[MAX_LINE], eb[MAX_LINE], ec[MAX_LINE];
+    char esc[MAX_LINE];
     size_t used;
 
     snprintf(buf, sizeof(buf), "%s", cmd);
     used = strlen(buf);
 
     const char *fields[3] = { a, b, c };
-    char *escaped[3] = { ea, eb, ec };
-
-    for (int i = 0; i < 3; i++) {
-        if (!fields[i])
-            break;
-        proto_escape(fields[i], escaped[i], sizeof(ea));
-        int n = snprintf(buf + used, sizeof(buf) - used, "|%s", escaped[i]);
+    for (int i = 0; i < 3 && fields[i]; i++) {
+        proto_escape(fields[i], esc, sizeof(esc));
+        int n = snprintf(buf + used, sizeof(buf) - used, "|%s", esc);
         if (n < 0 || (size_t)n >= sizeof(buf) - used) {
             printf("\n[!] Request too long.\n");
             return -1;
@@ -53,22 +48,19 @@ static int request(const char *cmd, const char *a, const char *b, const char *c)
     return 0;
 }
 
+// Reads one response line; returns -1 if the server went away.
 static int read_response(char *buf, size_t n)
 {
     int rc = recv_line(g_fd, buf, n);
 
-    if (rc == 0) {
+    if (rc <= 0) {
         printf("\n[!] Server closed the connection.\n");
-        return -1;
-    }
-    if (rc < 0) {
-        printf("\n[!] Network error while reading.\n");
         return -1;
     }
     return 0;
 }
 
-/* Reads a line of user input; returns 0 on EOF. */
+// Shows a label and reads one line of input; returns 0 on EOF.
 static int prompt(const char *label, char *out, size_t n)
 {
     printf("%s", label);
@@ -76,12 +68,11 @@ static int prompt(const char *label, char *out, size_t n)
 
     if (!fgets(out, (int)n, stdin))
         return 0;
-
     out[strcspn(out, "\r\n")] = '\0';
     return 1;
 }
 
-/* Reads a multi-line body terminated by a single '.' line. */
+// Reads the message body line by line until a single "." line.
 static int prompt_body(char *out, size_t n)
 {
     size_t used = 0;
@@ -99,12 +90,12 @@ static int prompt_body(char *out, size_t n)
         line[strcspn(line, "\r\n")] = '\0';
 
         if (strcmp(line, ".") == 0)
-            break;
+            return 1;
 
         size_t need = strlen(line) + (used ? 1 : 0);
         if (used + need + 1 >= n) {
-            printf("[!] Body too long, truncating at %zu bytes.\n", n - 1);
-            break;
+            printf("[!] Body too long, truncating.\n");
+            return 1;
         }
         if (used) {
             out[used++] = '\n';
@@ -113,33 +104,29 @@ static int prompt_body(char *out, size_t n)
         strcat(out, line);
         used += strlen(line);
     }
-    return 1;
 }
 
-/* Response helpers */
+// Prints an ERR response as "[!] CODE: message".
 static void print_error(const char *resp)
 {
     char copy[MAX_LINE];
-    char *fields[4];
+    char *fields[4] = {0};
 
     snprintf(copy, sizeof(copy), "%s", resp);
     if (split_fields(copy, fields, 4) >= 2)
-        printf("[!] %s: %s\n", fields[1],
-               fields[2] ? fields[2] : "request failed");
+        printf("[!] %s: %s\n", fields[0], fields[1]);
     else
         printf("[!] %s\n", resp);
 }
 
-/* Commands */
+// Menu 1: asks for username, email and password, then sends REGISTER.
 static void do_register(void)
 {
-    char user[MAX_USER], email[MAX_EMAIL], pass[128], resp[MAX_LINE];
+    char user[MAX_USER], email[MAX_EMAIL], pass[MAX_PASSWORD], resp[MAX_LINE];
 
-    if (!prompt("Username: ", user, sizeof(user)))
-        return;
-    if (!prompt("Email: ", email, sizeof(email)))
-        return;
-    if (!prompt("Password: ", pass, sizeof(pass)))
+    if (!prompt("Username: ", user, sizeof(user)) ||
+        !prompt("Email: ", email, sizeof(email)) ||
+        !prompt("Password: ", pass, sizeof(pass)))
         return;
 
     if (request("REGISTER", user, email, pass) < 0)
@@ -153,14 +140,14 @@ static void do_register(void)
         print_error(resp);
 }
 
+// Menu 2: asks for username and password, then sends LOGIN.
 static void do_login(void)
 {
-    char user[MAX_USER], pass[128], resp[MAX_LINE];
-    char *fields[8];
+    char user[MAX_USER], pass[MAX_PASSWORD], resp[MAX_LINE];
+    char copy[MAX_LINE], *fields[8];
 
-    if (!prompt("Username: ", user, sizeof(user)))
-        return;
-    if (!prompt("Password: ", pass, sizeof(pass)))
+    if (!prompt("Username: ", user, sizeof(user)) ||
+        !prompt("Password: ", pass, sizeof(pass)))
         return;
 
     if (request("LOGIN", user, pass, NULL) < 0)
@@ -173,7 +160,6 @@ static void do_login(void)
         return;
     }
 
-    char copy[MAX_LINE];
     snprintf(copy, sizeof(copy), "%s", resp);
     int nf = split_fields(copy, fields, 8);
     snprintf(g_user, sizeof(g_user), "%s", nf > 1 ? fields[1] : user);
@@ -185,6 +171,7 @@ static void do_login(void)
         printf("    Unread messages: %s\n", fields[3]);
 }
 
+// Menu 7: sends LOGOUT and clears the local session.
 static void do_logout(void)
 {
     char resp[MAX_LINE];
@@ -207,6 +194,7 @@ static void do_logout(void)
     }
 }
 
+// Menu 3: asks for recipients, subject and body, then sends SEND.
 static void do_send(void)
 {
     char to[MAX_TO], subject[MAX_SUBJECT], body[MAX_BODY], resp[MAX_LINE];
@@ -215,11 +203,9 @@ static void do_send(void)
         printf("[!] Please log in first.\n");
         return;
     }
-    if (!prompt("To (comma separated usernames): ", to, sizeof(to)))
-        return;
-    if (!prompt("Subject: ", subject, sizeof(subject)))
-        return;
-    if (!prompt_body(body, sizeof(body)))
+    if (!prompt("To (comma separated usernames): ", to, sizeof(to)) ||
+        !prompt("Subject: ", subject, sizeof(subject)) ||
+        !prompt_body(body, sizeof(body)))
         return;
 
     if (request("SEND", to, subject, body) < 0)
@@ -228,7 +214,7 @@ static void do_send(void)
         return;
 
     if (strncmp(resp, "OK ", 3) == 0) {
-        char copy[MAX_LINE], *fields[4];
+        char copy[MAX_LINE], *fields[4] = {0};
         snprintf(copy, sizeof(copy), "%s", resp);
         split_fields(copy, fields, 4);
         printf("[+] Message sent (id %s) to %s.\n",
@@ -238,6 +224,7 @@ static void do_send(void)
     }
 }
 
+// Menu 4/6: prints the inbox or sent box as a table.
 static void print_mail_table(const char *title, int sent_box)
 {
     char resp[MAX_LINE];
@@ -263,8 +250,7 @@ static void print_mail_table(const char *title, int sent_box)
     printf("--------------------------------------------------------------------------\n");
 
     for (;;) {
-        char line[MAX_LINE];
-        char *f[8];
+        char line[MAX_LINE], copy[MAX_LINE], *f[8];
         char from[MAX_USER], to[MAX_TO], subj[MAX_SUBJECT];
 
         if (read_response(line, sizeof(line)) < 0)
@@ -274,7 +260,6 @@ static void print_mail_table(const char *title, int sent_box)
         if (strncmp(line, "M|", 2) != 0)
             continue;
 
-        char copy[MAX_LINE];
         snprintf(copy, sizeof(copy), "%s", line);
         if (split_fields(copy, f, 8) != 7)
             continue;
@@ -295,10 +280,11 @@ static void print_mail_table(const char *title, int sent_box)
     printf("%d message(s)\n", count);
 }
 
+// Menu 5: asks for a message id and prints the full message.
 static void do_read(void)
 {
     char idbuf[32], resp[MAX_LINE];
-    char *f[8];
+    char copy[MAX_LINE], *f[8];
     char from[MAX_USER], to[MAX_TO], subj[MAX_SUBJECT], body[MAX_BODY];
 
     if (!g_logged_in) {
@@ -318,7 +304,6 @@ static void do_read(void)
         return;
     }
 
-    char copy[MAX_LINE];
     snprintf(copy, sizeof(copy), "%s", resp);
     if (split_fields(copy, f, 8) != 8) {
         printf("[!] Malformed READ response.\n");
@@ -341,57 +326,7 @@ static void do_read(void)
     printf("============================================================\n");
 }
 
-static void do_delete(void)
-{
-    char idbuf[32], box[16], resp[MAX_LINE];
-
-    if (!g_logged_in) {
-        printf("[!] Please log in first.\n");
-        return;
-    }
-    if (!prompt("Message ID: ", idbuf, sizeof(idbuf)))
-        return;
-    if (!prompt("Box [inbox/sent] (default inbox): ", box, sizeof(box)))
-        return;
-
-    if (box[0] == '\0')
-        snprintf(box, sizeof(box), "inbox");
-
-    if (request("DELETE", idbuf, box, NULL) < 0)
-        return;
-    if (read_response(resp, sizeof(resp)) < 0)
-        return;
-
-    if (strncmp(resp, "OK ", 3) == 0)
-        printf("[+] Message %s deleted from %s.\n", idbuf, box);
-    else
-        print_error(resp);
-}
-
-static void do_stats(void)
-{
-    char resp[MAX_LINE], *f[8];
-
-    if (!g_logged_in) {
-        printf("[!] Please log in first.\n");
-        return;
-    }
-    if (request("STATS", NULL, NULL, NULL) < 0)
-        return;
-    if (read_response(resp, sizeof(resp)) < 0)
-        return;
-
-    if (strncmp(resp, "OK ", 3) != 0) {
-        print_error(resp);
-        return;
-    }
-    char copy[MAX_LINE];
-    snprintf(copy, sizeof(copy), "%s", resp);
-    if (split_fields(copy, f, 8) >= 4)
-        printf("Inbox: %s message(s), %s unread | Sent: %s message(s)\n",
-               f[1], f[2], f[3]);
-}
-
+// Draws the main menu and the current login state.
 static void print_menu(void)
 {
     printf("\n================ MiniMail ================\n");
@@ -406,15 +341,14 @@ static void print_menu(void)
     printf(" 4. View Inbox\n");
     printf(" 5. Read a message\n");
     printf(" 6. View Sent mail\n");
-    printf(" 7. Delete a message\n");
-    printf(" 8. Mailbox statistics\n");
-    printf(" 9. Logout\n");
+    printf(" 7. Logout\n");
     printf(" 0. Quit\n");
     printf("==========================================\n");
     printf("Choice: ");
     fflush(stdout);
 }
 
+// Resolves the host and opens a TCP connection; returns the socket or -1.
 static int connect_to(const char *host, int port)
 {
     struct addrinfo hints, *res = NULL, *p;
@@ -449,6 +383,7 @@ static int connect_to(const char *host, int port)
     return fd;
 }
 
+// Prints the client command-line options.
 static void usage(const char *prog)
 {
     printf("Usage: %s [-h host] [-p port]\n", prog);
@@ -456,6 +391,7 @@ static void usage(const char *prog)
     printf("  -p port   server port (default %d)\n", DEFAULT_PORT);
 }
 
+// Parses options, connects to the server, and runs the menu loop.
 int main(int argc, char **argv)
 {
     const char *host = DEFAULT_HOST;
@@ -465,9 +401,7 @@ int main(int argc, char **argv)
 
     while ((opt = getopt(argc, argv, "h:p:")) != -1) {
         switch (opt) {
-        case 'h':
-            host = optarg;
-            break;
+        case 'h': host = optarg; break;
         case 'p':
             port = atoi(optarg);
             if (port <= 0 || port > 65535) {
@@ -475,9 +409,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             break;
-        default:
-            usage(argv[0]);
-            return 1;
+        default: usage(argv[0]); return 1;
         }
     }
 
@@ -490,12 +422,6 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("[+] Connected to %s:%d\n", host, port);
-    if (strncmp(resp, "OK ", 3) == 0) {
-        char copy[MAX_LINE], *f[4];
-        snprintf(copy, sizeof(copy), "%s", resp);
-        if (split_fields(copy, f, 4) >= 2)
-            printf("    Server: %s\n", f[1]);
-    }
 
     for (;;) {
         char choice[16];
@@ -511,9 +437,7 @@ int main(int argc, char **argv)
         case '4': print_mail_table("INBOX", 0); break;
         case '5': do_read(); break;
         case '6': print_mail_table("SENT MAIL", 1); break;
-        case '7': do_delete(); break;
-        case '8': do_stats(); break;
-        case '9': do_logout(); break;
+        case '7': do_logout(); break;
         case '0':
             request("QUIT", NULL, NULL, NULL);
             read_response(resp, sizeof(resp));
@@ -528,8 +452,6 @@ int main(int argc, char **argv)
         }
     }
 
-    if (g_logged_in)
-        request("LOGOUT", NULL, NULL, NULL);
     request("QUIT", NULL, NULL, NULL);
     close(g_fd);
     printf("\n[+] Disconnected.\n");

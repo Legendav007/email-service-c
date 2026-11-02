@@ -96,7 +96,7 @@ REGISTER|<username>|<email>|<password>
 |-------|-------|
 | username | 3–31 chars, starts with a letter, then letters/digits/`.`/`_` |
 | email | `local@domain.tld`, no spaces, `< 128` chars |
-| password | 6–64 chars, stored as plain text on the server |
+| password | at least 6 chars, stored as plain text on the server |
 
 Responses:
 
@@ -108,7 +108,6 @@ ERR INVALID_EMAIL|...
 ERR WEAK_PASSWORD|...
 ERR USER_EXISTS|Username 'alice' is already registered
 ERR EMAIL_EXISTS|E-mail 'alice@iitlab.local' is already registered
-ERR STORAGE|Could not persist the new account
 ```
 
 ### 6.2 `LOGIN`
@@ -124,13 +123,11 @@ OK LOGIN|<username>|<email>|<unread_count>
 ERR BAD_REQUEST|LOGIN needs username and password
 ERR NO_SUCH_USER|No account named 'x'
 ERR BAD_PASSWORD|Incorrect password
-ERR ALREADY_LOGGED_IN|You are already logged in as alice
-ERR ALREADY_ACTIVE|'alice' already has an active session
-ERR SERVER_BUSY|Too many active sessions, try again later
+ERR ALREADY_LOGGED_IN|Already logged in as alice
 ```
 
-`ERR ALREADY_ACTIVE` is returned when the same account is logged in on another
-connection. The session is released on `LOGOUT`, `QUIT`, or an abrupt disconnect.
+A second `LOGIN` on the same connection is rejected. The session ends on
+`LOGOUT`, `QUIT`, or disconnect.
 
 ### 6.3 `LOGOUT`
 
@@ -150,8 +147,8 @@ SEND|<recipients>|<subject>|<body>
 ```
 
 * `recipients` — comma-separated usernames, 1–10 entries.
-* `subject` — non-empty, `< 128` chars.
-* `body` — non-empty, `<= 4096` bytes; newlines encoded as `\n`.
+* `subject` — non-empty.
+* `body` — non-empty; newlines encoded as `\n`.
 
 Responses:
 
@@ -161,17 +158,13 @@ ERR NOT_LOGGED_IN|Please LOGIN first
 ERR BAD_REQUEST|SEND needs recipients, subject, body
 ERR NO_RECIPIENTS|At least one recipient is required
 ERR EMPTY_SUBJECT|Subject must not be empty
-ERR SUBJECT_TOO_LONG|Subject exceeds 127 characters
 ERR EMPTY_BODY|Message body must not be empty
-ERR MESSAGE_TOO_LONG|Body exceeds 4096 bytes
 ERR TOO_MANY_RECIPIENTS|At most 10 recipients
 ERR UNKNOWN_RECIPIENT|No such user: 'ghost'
-ERR STORAGE|Could not deliver to 'bob'
 ```
 
-Delivery is all-or-nothing: every recipient is validated before anything is
-written. One copy is stored per recipient inbox, plus one copy in the sender's
-sent box.
+Every recipient is validated before anything is written. One copy goes to each
+recipient inbox, plus one copy in the sender's sent box.
 
 ### 6.5 `INBOX` / `SENT`
 
@@ -203,68 +196,12 @@ READ|<id>
 ```
 OK READ|<id>|<from>|<to>|<subject>|<date>|1|<body>
 ERR BAD_REQUEST|READ needs a message id
-ERR BAD_REQUEST|Invalid message id
 ERR NO_SUCH_MAIL|No inbox message with id 42
 ```
 
 Reading an inbox message marks it read as a side effect.
 
-### 6.7 `DELETE`
-
-```
-DELETE|<id>[|inbox|sent]
-```
-
-Box defaults to `inbox`.
-
-```
-OK DELETE|<id>
-ERR BAD_REQUEST|DELETE needs id [inbox|sent]
-ERR BAD_REQUEST|Box must be 'inbox' or 'sent'
-ERR NO_SUCH_MAIL|No message with id 42
-```
-
-### 6.8 `STATS`
-
-```
-STATS
-```
-
-```
-OK STATS|<inbox_total>|<unread>|<sent_total>
-```
-
-### 6.9 `WHOAMI`
-
-```
-WHOAMI
-```
-
-```
-OK WHOAMI|<username>|<email>
-```
-
-### 6.10 `PING`
-
-```
-PING
-```
-
-```
-OK PONG|MiniMail/1.0
-```
-
-### 6.11 `HELP`
-
-```
-HELP
-```
-
-```
-OK HELP|REGISTER|LOGIN|LOGOUT|SEND|INBOX|SENT|READ|DELETE|STATS|WHOAMI|PING|QUIT
-```
-
-### 6.12 `QUIT`
+### 6.7 `QUIT`
 
 ```
 QUIT
@@ -283,7 +220,7 @@ The server closes the connection after replying.
 Immediately after `accept()`, the server sends:
 
 ```
-OK WELCOME|MiniMail/1.0|Send HELP for the command list
+OK WELCOME|MiniMail/1.0|Connected
 ```
 
 ---
@@ -300,12 +237,10 @@ OK WELCOME|MiniMail/1.0|Send HELP for the command list
 | `NO_SUCH_USER` | Login for an unknown account |
 | `BAD_PASSWORD` | Wrong password |
 | `ALREADY_LOGGED_IN` | Second `LOGIN` on the same connection |
-| `ALREADY_ACTIVE` | Account already logged in elsewhere |
-| `SERVER_BUSY` | Session table is full (128 active sessions) |
 | `NOT_LOGGED_IN` | Command requires authentication |
-| `NO_RECIPIENTS` / `EMPTY_SUBJECT` / `SUBJECT_TOO_LONG` / `EMPTY_BODY` / `MESSAGE_TOO_LONG` / `TOO_MANY_RECIPIENTS` | `SEND` validation |
+| `NO_RECIPIENTS` / `EMPTY_SUBJECT` / `EMPTY_BODY` / `TOO_MANY_RECIPIENTS` | `SEND` validation |
 | `UNKNOWN_RECIPIENT` | Recipient account does not exist |
-| `NO_SUCH_MAIL` | Message id not found in that box |
+| `NO_SUCH_MAIL` | Message id not found in the inbox |
 | `STORAGE` | Server-side file I/O failure |
 
 ---
@@ -319,16 +254,16 @@ OK WELCOME|MiniMail/1.0|Send HELP for the command list
 | Subject | 127 chars |
 | Username | 31 chars |
 | E-mail | 127 chars |
-| Password | 6–64 chars |
+| Password | at least 6 chars |
 | Recipients per message | 10 |
-| Concurrent clients | 128 |
+| Concurrent clients | limited by threads |
 
 ---
 
 ## 10. Example exchange
 
 ```
-S: OK WELCOME|MiniMail/1.0|Send HELP for the command list
+S: OK WELCOME|MiniMail/1.0|Connected
 C: REGISTER|alice|alice@iitlab.local|secret123
 S: OK REGISTER|alice|alice@iitlab.local
 C: LOGIN|alice|secret123
