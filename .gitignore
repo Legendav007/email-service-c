@@ -1,0 +1,18 @@
+# Build artefacts
+server
+client
+*.o
+*.d
+
+# Runtime data (created by the server)
+data/
+tests/tmp/
+
+# Editor / OS noise
+.vscode/
+*.swp
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
